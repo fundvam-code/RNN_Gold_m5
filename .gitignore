@@ -1,0 +1,18 @@
+# Python local files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.claude/settings.local.json
+
+# Compiled and generated model files
+*.ex5
+*.onnx
+/artifacts/
+/output/
+
+# Exported datasets and runtime logs
+/data/*.csv
+/TargetWinRate_report.csv
+*.log
