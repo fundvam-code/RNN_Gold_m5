@@ -1,11 +1,11 @@
 """Canonical preprocessing (v2) for the 20-bar, 12-feature BUY ONNX contract.
 
 Input : CSV exported by PrepareData.mq5 v2.x (Common\\Files\\data_BUY_*.csv)
-        Each row = one BUY signal with a 20-bar M5 window (lag0 = newest).
+        Each row = one BUY signal with a 20-bar M5 window (lag0 = oldest, lag19 = signal bar).
 Columns: datetime, signal, lag0_*...lag19_*, result, label
 Raw per-bar features (12): open, high, low, close, direction,
         ema8, ema21, rsi, atr, bb_upper, bb_mid, bb_lower
-label  : "[1,0]" -> сделка закрылась по TP => класс 1 (прибыль)
+label  : "[1,0]" -> закрытие по TP или прибыль >= заданного порога => класс 1
          "[0,1]" -> иначе (SL / удержание / конец дня) => класс 0
 
 Output: artifacts/data_BUY_*_normalized.npz with
@@ -148,7 +148,7 @@ def process_file(path: Path, output_dir: Path) -> dict:
 
 def write_contract(output_dir: Path) -> None:
     contract = {
-        "version": 3,
+        "version": 4,
         "raw_bars": RAW_BARS,
         "raw_features": RAW_FEATURES,
         "model_features": MODEL_FEATURES,
@@ -159,7 +159,9 @@ def write_contract(output_dir: Path) -> None:
         "label_map": {"[1,0]": 1, "[0,1]": 0, "else": 0},
         "eps": EPS,
         "schema_fingerprint": schema_fingerprint(),
-        "onnx_input_shape": [1, RAW_BARS, MODEL_FEATURES],
+        "bar_order": "oldest_to_newest",
+        "sequence_selection": "last_seq_len",
+        "normalized_window_shape": [RAW_BARS, MODEL_FEATURES],
     }
     (output_dir / "model_features.json").write_text(json.dumps(contract, indent=2), encoding="utf-8")
 

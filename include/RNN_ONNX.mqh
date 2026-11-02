@@ -6,7 +6,7 @@
 //|     - 12 признаков на бар: open, high, low, close, direction,   |
 //|       ema8, ema21, rsi, atr, bb_upper, bb_mid, bb_lower          |
 //|     - окно нормализации: 20 баров (NN_*_NORM_WINDOW), в сеть     |
-//|       идут первые NN_*_SEQ_LEN баров окна (для BUY = 18);        |
+//|       идут последние NN_*_SEQ_LEN баров окна;        |
 //|     - нормализация: row-local z-score (ddof=0) по окну, канал    |
 //|       direction (индекс 4) НЕ нормализуется;                     |
 //|     - вход ONNX: float32 [1, SEQ_LEN, 12], выход [1, 2] (логиты),|
@@ -43,6 +43,7 @@ int g_nn_input_size[2] = {NN_BUY_SEQ_LEN * NN_FEATURES, NN_SELL_SEQ_LEN * NN_FEA
 
 //--- Хендлы ONNX-сессий (0 = BUY, 1 = SELL), SELL опциональна ---
 long   g_onnx_handle[2] = {INVALID_HANDLE, INVALID_HANDLE};
+string g_onnx_sha256[2];
 string g_onnx_file[2];            // имена загруженных ONNX-файлов (для лога)
 bool   g_onnx_ready     = false;
 
@@ -149,20 +150,26 @@ long NN_OnnxLoadFromBuffer(const string model_path, const int direction)
      }
    FileClose(file);
 
+   uchar key[], digest[];
+   if(CryptEncode(CRYPT_HASH_SHA256, buffer, key, digest) != 32)
+     {
+      PrintFormat("ONNX[%s]: не удалось вычислить SHA-256 модели", tag);
+      return(INVALID_HANDLE);
+     }
+   g_onnx_sha256[direction] = "";
+   for(int i = 0; i < 32; i++)
+      g_onnx_sha256[direction] += StringFormat("%02x", digest[i]);
+
+   if(direction == 0 && (NN_BUY_MODEL_SHA256 == "" || g_onnx_sha256[0] != NN_BUY_MODEL_SHA256))
+     {
+      Print("ONNX[BUY]: модель не соответствует скомпилированному RNN_Scaler.mqh; переобучите и скомпилируйте EA");
+      return(INVALID_HANDLE);
+     }
    long h = OnnxCreateFromBuffer(buffer, 0);
    if(h == INVALID_HANDLE)
      {
-      PrintFormat("ONNX[%s]: OnnxCreateFromBuffer('%s') не удался (код %d), пробуем OnnxCreate...",
-                  tag, model_path, GetLastError());
-      ResetLastError();
-      h = OnnxCreate(model_path, 0);
-      if(h == INVALID_HANDLE)
-        {
-         PrintFormat("ONNX[%s]: OnnxCreate('%s') тоже не удался (код %d).",
-                     tag, model_path, GetLastError());
-         return(INVALID_HANDLE);
-        }
-      PrintFormat("ONNX[%s]: загружена через OnnxCreate(файл) '%s'", tag, model_path);
+      PrintFormat("ONNX[%s]: OnnxCreateFromBuffer failed (code %d)", tag, GetLastError());
+      return(INVALID_HANDLE);
      }
 
    //--- Явно задаём формы входов/выходов ---
@@ -171,10 +178,12 @@ long NN_OnnxLoadFromBuffer(const string model_path, const int direction)
       shape_ok = OnnxSetInputShape(h, 0, g_nn_input_shape_buy);
    else
       shape_ok = OnnxSetInputShape(h, 0, g_nn_input_shape_sell);
-   if(!shape_ok)
-      PrintFormat("ONNX[%s]: OnnxSetInputShape (код %d)", tag, GetLastError());
-   if(!OnnxSetOutputShape(h, 0, g_nn_output_shape))
-      PrintFormat("ONNX[%s]: OnnxSetOutputShape (код %d)", tag, GetLastError());
+   if(!shape_ok || !OnnxSetOutputShape(h, 0, g_nn_output_shape))
+     {
+      PrintFormat("ONNX[%s]: несовместимая форма входа или выхода (код %d)", tag, GetLastError());
+      OnnxRelease(h);
+      return(INVALID_HANDLE);
+     }
 
    //--- Диагностика ---
    long in_count  = OnnxGetInputCount(h);
@@ -278,7 +287,7 @@ void NN_FillBarFeatures(const int bar,
 
 //+------------------------------------------------------------------+
 //| Построение вектора СЫРЫХ признаков (norm_window баров x 12).     |
-//| Порядок баров: сигнальный (самый свежий, lag0) -> более старые. |
+//| Порядок баров: от самого старого к сигнальному (свежему). |
 //| Если истории меньше norm_window — недостающие (старые) бары      |
 //| добиваются средним по доступным барам.                           |
 //+------------------------------------------------------------------+
@@ -343,7 +352,7 @@ void NN_BuildFeatures(const int signal_shift,
 //+------------------------------------------------------------------+
 //| Нормализация контракта v2: row-local z-score (ddof=0) по окну    |
 //| для каналов из маски (все, кроме direction=4). Медианная         |
-//| коррекция НЕ применяется. В тензор идут первые seq_len баров.    |
+//| коррекция НЕ применяется. В тензор идут последние seq_len баров.    |
 //+------------------------------------------------------------------+
 void NN_ApplyRollingNorm(const int direction, const double &raw[])
   {
@@ -375,12 +384,13 @@ void NN_ApplyRollingNorm(const int direction, const double &raw[])
          std[f] = NN_NORM_STD_EPS;
      }
 
-   // --- заполнение входного тензора первыми seq_len барами окна ---
+   // --- последние seq_len баров в порядке от старого к свежему ---
    for(int k = 0; k < g_nn_seq_len[direction]; k++)
       for(int f = 0; f < NN_FEATURES; f++)
         {
          int i = k * NN_FEATURES + f;
-         double value = g_nn_norm_flag[f] ? ((raw[i] - mean[f]) / std[f]) : raw[i];
+         int source = (norm_window - g_nn_seq_len[direction] + k) * NN_FEATURES + f;
+         double value = g_nn_norm_flag[f] ? ((raw[source] - mean[f]) / std[f]) : raw[source];
          float fv = (float)value;
          if(direction == 0)
             g_nn_input_buy[i] = fv;

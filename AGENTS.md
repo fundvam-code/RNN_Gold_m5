@@ -27,3 +27,7 @@ Follow nearby MQL5 formatting and preserve platform event handler names. Prefix 
 ## Change Review
 
 Keep refactors separate from trading-logic changes where practical. Describe affected EA/data workflow and report the exact compile or runtime checks performed.
+
+## MetaTrader MCP Scope
+
+Use the built-in MetaEditor MCP only to compile MQL5 files. Do not use MCP terminal or other MetaTrader MCP operations for source inspection, workspace discovery, testing, trading, or runtime checks; inspect project files directly for code analysis.

@@ -1,272 +1,124 @@
 #!/usr/bin/env python3
+"""Stage a trained model, then publish it only after EA diagnostics pass.
+
+Use --stage before compiling and running the EA in the tester. Run
+verify_rnn_diagnostic.py on the resulting CSV, then use --finalize.
 """
-RNN Model Deployment & Validation Script
+from __future__ import annotations
 
-Проверяет согласованность ONNX модели, RNN_Scaler.mqh и summary.json,
-затем распределяет файлы в нужные директории MetaTrader 5.
-
-Проверяет:
-- Размер окна (seq_len): ONNX ↔ RNN_Scaler.mqh ↔ summary.json
-- Количество признаков (n_features): ONNX ↔ RNN_Scaler.mqh ↔ summary.json
-- Наличие файлов и их доступность
-- Версионирование моделей (timestamp)
-
-Копирует в:
-- ONNX модель → Common\Files\RNN_GOLD\buy_model.onnx
-- RNN_Scaler.mqh → MQL5\Experts\RNN_gold_M5_BUY\include\RNN_Scaler.mqh
-"""
-
-import os
-import sys
+import argparse
+import hashlib
 import json
-import shutil
-import re
+import os
 from pathlib import Path
-from datetime import datetime
+import re
+import shutil
 
-# Пути
-COLAB_OUTPUT_DIR = Path(r"H:\Мой диск\RNN\output")
-MT5_COMMON_DIR = Path(r"C:\Users\Aser\AppData\Roaming\MetaQuotes\Terminal\Common\Files")
-MT5_RNN_GOLD_DIR = MT5_COMMON_DIR / "RNN_GOLD_M5"
-MT5_EXPERT_DIR = Path(r"C:\Users\Aser\AppData\Roaming\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075\MQL5\Experts\RNN_gold_M5_BUY")
-
-# Цвета для консоли
-GREEN = '\033[92m'
-RED = '\033[91m'
-YELLOW = '\033[93m'
-CYAN = '\033[96m'
-RESET = '\033[0m'
+CONTRACT = 'oldest_to_newest_last_seq_v1'
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_OUTPUT = Path(r'H:\Мой диск\RNN\output')
+DEFAULT_COMMON = Path(r'C:\Users\Aser\AppData\Roaming\MetaQuotes\Terminal\Common\Files\RNN_GOLD_M5')
 
 
-def log_ok(msg):
-    print(f"{GREEN}✓ {msg}{RESET}")
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def log_error(msg):
-    print(f"{RED}✗ {msg}{RESET}")
+def read_defines(path: Path) -> dict:
+    result = {}
+    for line in path.read_text(encoding='utf-8').splitlines():
+        match = re.match(r'^\s*#define\s+(NN_\w+)\s+([^\s/]+)', line)
+        if match:
+            result[match.group(1)] = match.group(2)
+    return result
 
 
-def log_warning(msg):
-    print(f"{YELLOW}⚠ {msg}{RESET}")
+def validate_export(output: Path):
+    import onnx
+    model = output / 'onnx' / 'buy_model.onnx'
+    scaler = output / 'RNN_Scaler.mqh'
+    summary = json.loads((output / 'final_results.json').read_text(encoding='utf-8'))
+    if summary.get('input_contract') != CONTRACT or summary.get('model_sha256') != sha256(model):
+        raise ValueError('Training metadata does not match model or current input contract')
+    parity = summary.get('onnx_parity', {})
+    if parity.get('passed') is not True or parity.get('samples', 0) < 1:
+        raise ValueError('PyTorch/ONNX comparison has not passed')
+    config = summary['model_config']
+    seq, features, window = int(config['seq_len']), int(config['n_features']), int(config['n_bars'])
+    if not 1 <= seq <= window or window != 20 or features != 12:
+        raise ValueError('Invalid training model configuration')
+    defs = read_defines(scaler)
+    if defs.get('NN_BUY_MODEL_SHA256', '').strip('\"') != sha256(model):
+        raise ValueError('Scaler model hash does not match ONNX')
+    expected = {'NN_BUY_SEQ_LEN': seq, 'NN_SELL_SEQ_LEN': seq, 'NN_MAX_SEQ_LEN': seq,
+                'NN_FEATURES': features, 'NN_BUY_NORM_WINDOW': window,
+                'NN_SELL_NORM_WINDOW': window, 'NN_MAX_NORM_WINDOW': window}
+    for key, value in expected.items():
+        if defs.get(key) != str(value):
+            raise ValueError(f'Scaler {key}: expected {value}, got {defs.get(key)}')
+    if float(defs.get('NN_NORM_STD_EPS', 'nan')) != 1e-6:
+        raise ValueError('Scaler epsilon must be 1e-6')
+    graph = onnx.load(str(model), load_external_data=False)
+    if any(t.data_location == onnx.TensorProto.EXTERNAL for t in graph.graph.initializer):
+        raise ValueError('ONNX external data is unsupported')
+    onnx.checker.check_model(graph)
+    if len(graph.graph.input) != 1 or len(graph.graph.output) != 1:
+        raise ValueError('ONNX must have one input and one output')
+    tensor = graph.graph.input[0].type.tensor_type
+    dims = tensor.shape.dim
+    if (tensor.elem_type != onnx.TensorProto.FLOAT or len(dims) != 3 or
+        (dims[0].HasField('dim_value') and dims[0].dim_value != 1) or
+        dims[1].dim_value != seq or dims[2].dim_value != features):
+        raise ValueError('ONNX input must be float32 [1 or batch, seq_len, 12]')
+    return model, scaler, summary
 
 
-def log_info(msg):
-    print(f"{CYAN}ℹ {msg}{RESET}")
-
-
-def read_onnx_shape(onnx_path):
-    """Читает размер входа из ONNX файла."""
+def copy_atomic(source: Path, destination: Path):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + '.tmp')
     try:
-        import onnx
-        model = onnx.load(str(onnx_path))
-        input_shape = model.graph.input[0].type.tensor_type.shape.dim
-        # input_shape[0] = batch (dynamic), input_shape[1] = seq_len, input_shape[2] = features
-        seq_len = input_shape[1].dim_value
-        n_features = input_shape[2].dim_value
-        return seq_len, n_features
-    except Exception as e:
-        log_error(f"Не удалось прочитать ONNX: {e}")
-        return None, None
-
-
-def read_mqh_defines(mqh_path):
-    """Читает #define значения из RNN_Scaler.mqh."""
-    defines = {}
-    try:
-        with open(mqh_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                match = re.match(r'#define\s+(\w+)\s+(\d+)', line)
-                if match:
-                    key, value = match.groups()
-                    defines[key] = int(value)
-        return defines
-    except Exception as e:
-        log_error(f"Не удалось прочитать MQH: {e}")
-        return {}
-
-
-def read_summary_json(json_path):
-    """Читает параметры из summary.json."""
-    try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            summary = json.load(f)
-        return summary
-    except Exception as e:
-        log_error(f"Не удалось прочитать summary.json: {e}")
-        return {}
-
-
-def validate_files():
-    """Проверяет наличие всех необходимых файлов."""
-    print(f"\n{CYAN}{'='*70}{RESET}")
-    print(f"{CYAN}ПРОВЕРКА ФАЙЛОВ{RESET}")
-    print(f"{CYAN}{'='*70}{RESET}\n")
-
-    files_ok = True
-
-    # Проверяем Colab output
-    if not COLAB_OUTPUT_DIR.exists():
-        log_error(f"Папка Colab не найдена: {COLAB_OUTPUT_DIR}")
-        files_ok = False
-    else:
-        log_ok(f"Colab output папка: {COLAB_OUTPUT_DIR}")
-
-    onnx_file = COLAB_OUTPUT_DIR / "onnx" / "buy_model.onnx"
-    if onnx_file.exists():
-        size_mb = onnx_file.stat().st_size / 1024 / 1024
-        log_ok(f"ONNX модель найдена ({size_mb:.1f} MB)")
-    else:
-        log_error(f"ONNX модель не найдена: {onnx_file}")
-        files_ok = False
-
-    scaler_file = COLAB_OUTPUT_DIR / "RNN_Scaler.mqh"
-    if scaler_file.exists():
-        log_ok(f"RNN_Scaler.mqh найден")
-    else:
-        log_error(f"RNN_Scaler.mqh не найден: {scaler_file}")
-        files_ok = False
-
-    summary_file = COLAB_OUTPUT_DIR / "summary.json"
-    if summary_file.exists():
-        log_ok(f"summary.json найден")
-    else:
-        log_error(f"summary.json не найден: {summary_file}")
-        files_ok = False
-
-    return files_ok, onnx_file, scaler_file, summary_file
-
-
-def validate_consistency(onnx_file, scaler_file, summary_file):
-    """Проверяет согласованность всех параметров."""
-    print(f"\n{CYAN}{'='*70}{RESET}")
-    print(f"{CYAN}ПРОВЕРКА СОГЛАСОВАННОСТИ{RESET}")
-    print(f"{CYAN}{'='*70}{RESET}\n")
-
-    consistency_ok = True
-
-    # Читаем параметры
-    onnx_seq, onnx_feat = read_onnx_shape(onnx_file)
-    mqh_defines = read_mqh_defines(scaler_file)
-    summary = read_summary_json(summary_file)
-
-    print(f"ONNX:       seq_len={onnx_seq}, n_features={onnx_feat}")
-    print(f"MQH:        NN_SEQ_LEN={mqh_defines.get('NN_SEQ_LEN')}, NN_FEATURES={mqh_defines.get('NN_FEATURES')}")
-    if summary.get('buy_metrics'):
-        print(f"summary.json: TP={summary['buy_metrics'].get('tp')}, FP={summary['buy_metrics'].get('fp')}, "
-              f"Precision={summary['buy_metrics'].get('precision'):.4f}\n")
-
-    # Проверяем seq_len
-    mqh_seq = mqh_defines.get('NN_SEQ_LEN')
-    if onnx_seq == mqh_seq:
-        log_ok(f"seq_len совпадает: {onnx_seq}")
-    else:
-        log_error(f"seq_len не совпадает: ONNX={onnx_seq}, MQH={mqh_seq}")
-        consistency_ok = False
-
-    # Проверяем n_features
-    mqh_feat = mqh_defines.get('NN_FEATURES')
-    if onnx_feat == mqh_feat:
-        log_ok(f"n_features совпадает: {onnx_feat}")
-    else:
-        log_error(f"n_features не совпадает: ONNX={onnx_feat}, MQH={mqh_feat}")
-        consistency_ok = False
-
-    # Проверяем что MQH имеет правильный epsilon
-    eps = mqh_defines.get('NN_NORM_STD_EPS')
-    if eps:
-        log_ok(f"NN_NORM_STD_EPS определён: {eps:g}")
-    else:
-        log_warning(f"NN_NORM_STD_EPS не найден в MQH")
-
-    # Проверяем metrics
-    if summary.get('buy_metrics'):
-        metrics = summary['buy_metrics']
-        tp = metrics.get('tp', 0)
-        fp = metrics.get('fp', 0)
-        total = tp + fp
-        precision = metrics.get('precision', 0.0)
-        if total > 0:
-            log_ok(f"Метрики найдены: TP={tp}, FP={fp}, Precision={precision:.4f}")
-        else:
-            log_warning(f"Метрики пусты: TP={tp}, FP={fp}")
-    else:
-        log_warning(f"Метрики не найдены в summary.json")
-
-    return consistency_ok
-
-
-def deploy_files(onnx_file, scaler_file):
-    """Копирует файлы в нужные директории."""
-    print(f"\n{CYAN}{'='*70}{RESET}")
-    print(f"{CYAN}РАЗВЁРТЫВАНИЕ ФАЙЛОВ{RESET}")
-    print(f"{CYAN}{'='*70}{RESET}\n")
-
-    deployment_ok = True
-
-    # Создаём директории если их нет
-    MT5_RNN_GOLD_DIR.mkdir(parents=True, exist_ok=True)
-    MT5_EXPERT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Копируем ONNX модель
-    try:
-        dest_onnx = MT5_RNN_GOLD_DIR / "buy_model.onnx"
-        shutil.copy2(onnx_file, dest_onnx)
-        size_mb = dest_onnx.stat().st_size / 1024 / 1024
-        log_ok(f"ONNX модель → {dest_onnx} ({size_mb:.1f} MB)")
-    except Exception as e:
-        log_error(f"Не удалось скопировать ONNX: {e}")
-        deployment_ok = False
-
-    # Копируем RNN_Scaler.mqh
-    try:
-        dest_mqh = MT5_EXPERT_DIR / "include" / "RNN_Scaler.mqh"
-        dest_mqh.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(scaler_file, dest_mqh)
-        log_ok(f"RNN_Scaler.mqh → {dest_mqh}")
-    except Exception as e:
-        log_error(f"Не удалось скопировать RNN_Scaler.mqh: {e}")
-        deployment_ok = False
-
-    return deployment_ok
+        shutil.copyfile(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main():
-    """Основная функция."""
-    print(f"\n{CYAN}{'='*70}{RESET}")
-    print(f"{CYAN}RNN Model Deployment & Validation{RESET}")
-    print(f"{CYAN}Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
-    print(f"{CYAN}{'='*70}{RESET}")
+    parser = argparse.ArgumentParser(description=__doc__)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument('--stage', action='store_true')
+    action.add_argument('--finalize', action='store_true')
+    parser.add_argument('--output-dir', type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument('--common-dir', type=Path, default=DEFAULT_COMMON)
+    parser.add_argument('--project-dir', type=Path, default=PROJECT_DIR)
+    parser.add_argument('--diagnostic', type=Path)
+    parser.add_argument('--report', type=Path)
+    args = parser.parse_args()
+    model, scaler, summary = validate_export(args.output_dir)
+    staged_model = args.common_dir / 'buy_model.candidate.onnx'
+    staged_scaler = args.project_dir / 'include' / 'RNN_Scaler.mqh'
+    if args.stage:
+        copy_atomic(model, staged_model)
+        copy_atomic(scaler, staged_scaler)
+        print(f'Staged model: {staged_model}')
+        print(f'Staged scaler: {staged_scaler}')
+        print('Compile the EA, then run tester diagnostics using the candidate model.')
+        return
+    if args.diagnostic is None or args.report is None:
+        parser.error('--finalize requires --diagnostic and --report')
+    if sha256(staged_model) != sha256(model) or sha256(staged_scaler) != sha256(scaler):
+        raise ValueError('Staged model or EA scaler differs from training output; stage and test again')
+    from verify_rnn_diagnostic import validate
+    actual = validate(args.diagnostic, staged_model, staged_scaler)
+    saved = json.loads(args.report.read_text(encoding='utf-8'))
+    identity_keys = ('passed', 'input_contract', 'model_sha256', 'scaler_sha256',
+                     'diagnostic_sha256', 'seq_len', 'raw_bars', 'features', 'eps', 'signal_time')
+    if (any(key not in saved or saved[key] != actual[key] for key in identity_keys) or
+        actual['seq_len'] != summary['model_config']['seq_len']):
+        raise ValueError('Diagnostic report does not match the staged model, scaler, and current diagnostic')
+    copy_atomic(staged_model, args.common_dir / 'buy_model.onnx')
+    print(f'Published verified model: {args.common_dir / "buy_model.onnx"}')
 
-    # Проверяем файлы
-    files_ok, onnx_file, scaler_file, summary_file = validate_files()
-    if not files_ok:
-        log_error("Проверка файлов не пройдена!")
-        return False
 
-    # Проверяем согласованность
-    consistency_ok = validate_consistency(onnx_file, scaler_file, summary_file)
-    if not consistency_ok:
-        log_error("Проверка согласованности не пройдена!")
-        return False
-
-    # Развёртываем файлы
-    deployment_ok = deploy_files(onnx_file, scaler_file)
-    if not deployment_ok:
-        log_error("Развёртывание не пройдено!")
-        return False
-
-    # Финальное сообщение
-    print(f"\n{CYAN}{'='*70}{RESET}")
-    print(f"{GREEN}✓ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ{RESET}")
-    print(f"{CYAN}{'='*70}{RESET}\n")
-    print(f"{CYAN}Файлы готовы к использованию в MetaTrader 5:{RESET}")
-    print(f"  • ONNX модель:    {MT5_RNN_GOLD_DIR}/buy_model.onnx")
-    print(f"  • RNN_Scaler:     {MT5_EXPERT_DIR}/include/RNN_Scaler.mqh")
-    print(f"\n{YELLOW}Перезагрузите MetaTrader 5 для применения изменений{RESET}\n")
-
-    return True
-
-
-if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+if __name__ == '__main__':
+    main()

@@ -41,7 +41,9 @@ input int    Inp_NNProfitClass     = 1;        // Класс "прибыльно
 
 // --- Путь к ONNX-модели BUY (относительно Common\Files или MQL5\Files) ---
 
-input string Inp_BuyModelFile     = "RNN_GOLD_M15\\buy_model.onnx";   // Файл модели BUY
+input string Inp_BuyModelFile     = "RNN_GOLD_M5\\buy_model.onnx";   // Файл модели BUY
+input bool   Inp_NNDiagnostics    = false; // Диагностика входа в тестере, без сделок
+input string Inp_NNDiagnosticFile = "RNN_GOLD_M5\\diagnostic.csv";
 
 // --- Торговые настройки (фиксированный лот, без серий/множителей) ---
 input group "Торговые настройки"
@@ -157,6 +159,7 @@ int                   g_drag_dy   = 0;
 
 int                   nn_buy_seq_len = 0;
 datetime              last_bar_time = 0;
+bool                  g_diagnostic_done = false;
 
 double                sl_price = 0.0;
 double                trail_points = 0.0;
@@ -176,6 +179,15 @@ double                bb_upper_buf[], bb_mid_buf[], bb_lower_buf[];   // Bolling
 //+------------------------------------------------------------------+
 int OnInit()
   {
+   // Диагностика разрешена только в тестере и требует включённую модель.
+   if(Inp_NNDiagnostics && (!MQLInfoInteger(MQL_TESTER) || !Inp_UseNNFilter))
+     {
+      Print("Диагностика доступна только в тестере при Inp_UseNNFilter=true");
+      return(INIT_FAILED);
+     }
+   if(Inp_NNProfitClass < 0 || Inp_NNProfitClass > 1)
+      return(INIT_PARAMETERS_INCORRECT);
+
    // --- Валидация параметров ---
    if(Inp_HoldBars < 1 || Inp_LotSize <= 0)
      {
@@ -244,7 +256,7 @@ int OnInit()
      {
       if(!NN_ONNX_Init(Inp_BuyModelFile, ""))
         {
-         Print("RNNFilter: не удалось загрузить ONNX-модель BUY. Файл должен лежать в Common\\Files\\RNN_GOLD\\");
+         Print("RNNFilter: не удалось загрузить ONNX-модель BUY. Файл должен лежать в Common\\Files\\RNN_GOLD_M5\\");
          return(INIT_FAILED);
         }
      }
@@ -263,7 +275,8 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    // Закрываем оставшиеся позиции
-   CloseAllDeals();
+   if(!Inp_NNDiagnostics)
+      CloseAllDeals();
 
    // Освобождаем ONNX-сессии
    if(Inp_UseNNFilter)
@@ -292,6 +305,12 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
   {
+   if(Inp_NNDiagnostics)
+     {
+      if(!g_diagnostic_done)
+         RunNNDiagnostics();
+      return;
+     }
    // Глобальный выключатель
    if(!Inp_Enabled)
      {
@@ -590,6 +609,120 @@ bool DetectBBSignal(datetime &signal_time)
    return true;
   }
 
+// Диагностика использует тот же сборщик и тот же OnnxRun, что торговый путь.
+void RunNNDiagnostics()
+  {
+   datetime signal_time = iTime(_Symbol, FEATURE_PERIOD, 1);
+   if(signal_time <= 0)
+      return;
+   datetime times[];
+   double raw[];
+   if(!CollectNNFeatures(signal_time, raw, times))
+      return; // история/индикаторы ещё не готовы
+   if(times[NN_BUY_NORM_WINDOW - 1] != signal_time)
+     {
+      Print("Диагностика: последний бар не совпадает с выбранным M5 баром");
+      g_diagnostic_done = true;
+      return;
+     }
+   for(int k = 1; k < NN_BUY_NORM_WINDOW; k++)
+      if(times[k] <= times[k - 1])
+        {
+         Print("Диагностика: время баров не возрастает");
+         g_diagnostic_done = true;
+         return;
+        }
+   double p0 = 0.0, p1 = 0.0;
+   if(!NN_OnnxRunModel(0, raw, p0, p1))
+     {
+      Print("Диагностика: ошибка ONNX");
+      g_diagnostic_done = true;
+      return;
+     }
+   FolderCreate("RNN_GOLD_M5", FILE_COMMON);
+   int file = FileOpen(Inp_NNDiagnosticFile, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   if(file == INVALID_HANDLE)
+     {
+      PrintFormat("Диагностика: ошибка записи %s (%d)", Inp_NNDiagnosticFile, GetLastError());
+      g_diagnostic_done = true;
+      return;
+     }
+   FileWriteString(file, "meta,version,1\n");
+   FileWriteString(file, "meta,model_sha256," + g_onnx_sha256[0] + "\n");
+   FileWriteString(file, "meta,signal_time," + IntegerToString((long)signal_time) + "\n");
+   FileWriteString(file, "meta,seq_len," + IntegerToString(nn_buy_seq_len) + "\n");
+   FileWriteString(file, "meta,profit_class," + IntegerToString(Inp_NNProfitClass) + "\n");
+   FileWriteString(file, "meta,probability," + DoubleToString(Inp_NNProfitClass == 0 ? p0 : p1, 16) + "\n");
+   for(int k = 0; k < NN_BUY_NORM_WINDOW; k++)
+     {
+      string row = "raw," + IntegerToString(k) + "," + IntegerToString((long)times[k]);
+      for(int f = 0; f < NN_FEATURES; f++)
+         row += "," + DoubleToString(raw[k * NN_FEATURES + f], 16);
+      FileWriteString(file, row + "\n");
+     }
+   for(int k = 0; k < nn_buy_seq_len; k++)
+     {
+      string row = "tensor," + IntegerToString(k);
+      for(int f = 0; f < NN_FEATURES; f++)
+         row += "," + DoubleToString((double)g_nn_input_buy[k * NN_FEATURES + f], 16);
+      FileWriteString(file, row + "\n");
+     }
+   FileClose(file);
+   g_diagnostic_done = true;
+   PrintFormat("Диагностика ONNX записана: Common/Files/%s", Inp_NNDiagnosticFile);
+  }
+
+bool CollectNNFeatures(const datetime signal_time, double &buy_features[], datetime &bar_times[])
+  {
+   int m5_shift = iBarShift(_Symbol, FEATURE_PERIOD, signal_time, false);
+   if(m5_shift < 0)
+     {
+      return(false);
+     }
+   if(m5_shift + NN_BUY_NORM_WINDOW > iBars(_Symbol, FEATURE_PERIOD))
+     {
+      return(false);
+     }
+
+   double open5[], close5[], high5[], low5[];
+   double ema8_5[], ema21_5[], rsi_5[], atr_5[];
+   double bb_upper5[], bb_mid5[], bb_lower5[];
+
+   if(CopyOpen(_Symbol, FEATURE_PERIOD, m5_shift, NN_BUY_NORM_WINDOW, open5) < NN_BUY_NORM_WINDOW ||
+      CopyClose(_Symbol, FEATURE_PERIOD, m5_shift, NN_BUY_NORM_WINDOW, close5) < NN_BUY_NORM_WINDOW ||
+      CopyHigh(_Symbol, FEATURE_PERIOD, m5_shift, NN_BUY_NORM_WINDOW, high5) < NN_BUY_NORM_WINDOW ||
+      CopyLow(_Symbol, FEATURE_PERIOD, m5_shift, NN_BUY_NORM_WINDOW, low5) < NN_BUY_NORM_WINDOW)
+     {
+      return(false);
+     }
+
+   if(CopyBuffer(handles[0], 0, m5_shift, NN_BUY_NORM_WINDOW, ema8_5) < NN_BUY_NORM_WINDOW ||
+      CopyBuffer(handles[1], 0, m5_shift, NN_BUY_NORM_WINDOW, ema21_5) < NN_BUY_NORM_WINDOW ||
+      CopyBuffer(handles[2], 0, m5_shift, NN_BUY_NORM_WINDOW, rsi_5) < NN_BUY_NORM_WINDOW ||
+      CopyBuffer(handles[3], 0, m5_shift, NN_BUY_NORM_WINDOW, atr_5) < NN_BUY_NORM_WINDOW)
+     {
+      return(false);
+     }
+
+   if(CopyBuffer(handle_bb, UPPER_BAND, m5_shift, NN_BUY_NORM_WINDOW, bb_upper5) < NN_BUY_NORM_WINDOW ||
+      CopyBuffer(handle_bb, BASE_LINE, m5_shift, NN_BUY_NORM_WINDOW, bb_mid5) < NN_BUY_NORM_WINDOW ||
+      CopyBuffer(handle_bb, LOWER_BAND, m5_shift, NN_BUY_NORM_WINDOW, bb_lower5) < NN_BUY_NORM_WINDOW)
+     {
+      return(false);
+     }
+
+   if(CopyTime(_Symbol, FEATURE_PERIOD, m5_shift, NN_BUY_NORM_WINDOW, bar_times) != NN_BUY_NORM_WINDOW)
+      return(false);
+
+   ArrayResize(buy_features, NN_BUY_NORM_WINDOW * NN_FEATURES);
+   NN_BuildFeatures(0, open5, close5, high5, low5,
+                    ema8_5, ema21_5, rsi_5, atr_5,
+                    bb_upper5, bb_mid5, bb_lower5,
+                    NN_BUY_NORM_WINDOW, NN_BUY_NORM_WINDOW, buy_features);
+
+   return(true);
+  }
+
 void CheckSignals()
   {
    // Детектируем BB-сигнал
@@ -603,55 +736,13 @@ void CheckSignals()
       return;
      }
 
-   // --- Сбор признаков M5 (если есть сигнал или режим без индикаторов) ---
-   int m5_shift = iBarShift(_Symbol, FEATURE_PERIOD, signal_time, false);
-   if(m5_shift < 0)
-     {
-      UpdateStatus();
-      return;
-     }
-   if(m5_shift + NN_BUY_NORM_WINDOW > iBars(_Symbol, FEATURE_PERIOD))
-     {
-      UpdateStatus();
-      return;
-     }
-
-   double open5[], close5[], high5[], low5[];
-   double ema8_5[], ema21_5[], rsi_5[], atr_5[];
-   double bb_upper5[], bb_mid5[], bb_lower5[];
-
-   if(CopyOpen(_Symbol, FEATURE_PERIOD, m5_shift, NN_BUY_NORM_WINDOW, open5) < NN_BUY_NORM_WINDOW ||
-      CopyClose(_Symbol, FEATURE_PERIOD, m5_shift, NN_BUY_NORM_WINDOW, close5) < NN_BUY_NORM_WINDOW ||
-      CopyHigh(_Symbol, FEATURE_PERIOD, m5_shift, NN_BUY_NORM_WINDOW, high5) < NN_BUY_NORM_WINDOW ||
-      CopyLow(_Symbol, FEATURE_PERIOD, m5_shift, NN_BUY_NORM_WINDOW, low5) < NN_BUY_NORM_WINDOW)
-     {
-      UpdateStatus();
-      return;
-     }
-
-   if(CopyBuffer(handles[0], 0, m5_shift, NN_BUY_NORM_WINDOW, ema8_5) < NN_BUY_NORM_WINDOW ||
-      CopyBuffer(handles[1], 0, m5_shift, NN_BUY_NORM_WINDOW, ema21_5) < NN_BUY_NORM_WINDOW ||
-      CopyBuffer(handles[2], 0, m5_shift, NN_BUY_NORM_WINDOW, rsi_5) < NN_BUY_NORM_WINDOW ||
-      CopyBuffer(handles[3], 0, m5_shift, NN_BUY_NORM_WINDOW, atr_5) < NN_BUY_NORM_WINDOW)
-     {
-      UpdateStatus();
-      return;
-     }
-
-   if(CopyBuffer(handle_bb, UPPER_BAND, m5_shift, NN_BUY_NORM_WINDOW, bb_upper5) < NN_BUY_NORM_WINDOW ||
-      CopyBuffer(handle_bb, BASE_LINE, m5_shift, NN_BUY_NORM_WINDOW, bb_mid5) < NN_BUY_NORM_WINDOW ||
-      CopyBuffer(handle_bb, LOWER_BAND, m5_shift, NN_BUY_NORM_WINDOW, bb_lower5) < NN_BUY_NORM_WINDOW)
-     {
-      UpdateStatus();
-      return;
-     }
-
    double buy_features[];
-   ArrayResize(buy_features, NN_BUY_NORM_WINDOW * NN_FEATURES);
-   NN_BuildFeatures(0, open5, close5, high5, low5,
-                    ema8_5, ema21_5, rsi_5, atr_5,
-                    bb_upper5, bb_mid5, bb_lower5,
-                    NN_BUY_NORM_WINDOW, NN_BUY_NORM_WINDOW, buy_features);
+   datetime bar_times[];
+   if(!CollectNNFeatures(signal_time, buy_features, bar_times))
+     {
+      UpdateStatus();
+      return;
+     }
 
    // --- Прогон BUY-сети ONNX ---
    double conf_buy = 0.0;
@@ -1007,6 +1098,8 @@ void Panel_LogInfo()
 //+------------------------------------------------------------------+
 void OnChartEvent(const int id,const long &lparam,const double &dparam,const string &sparam)
   {
+   if(Inp_NNDiagnostics)
+      return;
    // --- Перетаскивание панелей мышью (Rectangle Label не тянется нативно) ---
    if(id==CHARTEVENT_MOUSE_MOVE)
      {

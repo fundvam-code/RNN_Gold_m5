@@ -6,6 +6,7 @@
 #ifndef RNN_SCALER_MQH
 #define RNN_SCALER_MQH
 
+#define NN_BUY_MODEL_SHA256 "" // Generated after verified retraining; empty disables ONNX
 #define NN_BUY_SEQ_LEN      12
 #define NN_SELL_SEQ_LEN     12
 #define NN_MAX_SEQ_LEN      12
